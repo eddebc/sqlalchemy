@@ -158,9 +158,7 @@ MySQLdb, MySQL-Client, MySQL-Connector Python, and PyMySQL.   Using it,
 the MySQL connection will return true for the value of
 ``SELECT @@autocommit;``.
 
-.. seealso::
-
-    :ref:`dbapi_autocommit`
+.. versionadded:: 1.1 - added support for the AUTOCOMMIT isolation level.
 
 AUTO_INCREMENT Behavior
 -----------------------
@@ -471,7 +469,7 @@ This setting is currently hardcoded.
 
 .. seealso::
 
-    :attr:`_engine.CursorResult.rowcount`
+    :attr:`_engine.ResultProxy.rowcount`
 
 
 CAST Support
@@ -672,95 +670,10 @@ with the ``unique=True`` setting present in the :attr:`_schema.Table.indexes`
 collection.
 
 
-TIMESTAMP / DATETIME issues
----------------------------
-
-.. _mysql_timestamp_onupdate:
-
-Rendering ON UPDATE CURRENT TIMESTAMP for MySQL's explicit_defaults_for_timestamp
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-MySQL has historically expanded the DDL for the :class:`_types.TIMESTAMP`
-datatype into the phrase "TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE
-CURRENT_TIMESTAMP", which includes non-standard SQL that automatically updates
-the column with the current timestamp when an UPDATE occurs, eliminating the
-usual need to use a trigger in such a case where server-side update changes are
-desired.
-
-MySQL 5.6 introduced a new flag `explicit_defaults_for_timestamp
-<http://dev.mysql.com/doc/refman/5.6/en/server-system-variables.html
-#sysvar_explicit_defaults_for_timestamp>`_ which disables the above behavior,
-and in MySQL 8 this flag defaults to true, meaning in order to get a MySQL
-"on update timestamp" without changing this flag, the above DDL must be
-rendered explicitly.   Additionally, the same DDL is valid for use of the
-``DATETIME`` datatype as well.
-
-SQLAlchemy's MySQL dialect does not yet have an option to generate
-MySQL's "ON UPDATE CURRENT_TIMESTAMP" clause, noting that this is not a general
-purpose "ON UPDATE" as there is no such syntax in standard SQL.  SQLAlchemy's
-:paramref:`_schema.Column.server_onupdate` parameter is currently not related
-to this special MySQL behavior.
-
-To generate this DDL, make use of the :paramref:`_schema.Column.server_default`
-parameter and pass a textual clause that also includes the ON UPDATE clause::
-
-    from sqlalchemy import Table, MetaData, Column, Integer, String, TIMESTAMP
-    from sqlalchemy import text
-
-    metadata = MetaData()
-
-    mytable = Table(
-        "mytable",
-        metadata,
-        Column('id', Integer, primary_key=True),
-        Column('data', String(50)),
-        Column(
-            'last_updated',
-            TIMESTAMP,
-            server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-        )
-    )
-
-The same instructions apply to use of the :class:`_types.DateTime` and
-:class:`_types.DATETIME` datatypes::
-
-    from sqlalchemy import DateTime
-
-    mytable = Table(
-        "mytable",
-        metadata,
-        Column('id', Integer, primary_key=True),
-        Column('data', String(50)),
-        Column(
-            'last_updated',
-            DateTime,
-            server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP")
-        )
-    )
-
-
-Even though the :paramref:`_schema.Column.server_onupdate` feature does not
-generate this DDL, it still may be desirable to signal to the ORM that this
-updated value should be fetched.  This syntax looks like the following::
-
-    from sqlalchemy.schema import FetchedValue
-
-    class MyClass(Base):
-        __tablename__ = 'mytable'
-
-        id = Column(Integer, primary_key=True)
-        data = Column(String(50))
-        last_updated = Column(
-            TIMESTAMP,
-            server_default=text("CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"),
-            server_onupdate=FetchedValue()
-        )
-
-
 .. _mysql_timestamp_null:
 
 TIMESTAMP Columns and NULL
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+--------------------------
 
 MySQL historically enforces that a column which specifies the
 TIMESTAMP datatype implicitly includes a default value of
@@ -891,10 +804,8 @@ from ... import types as sqltypes
 from ... import util
 from ...engine import default
 from ...engine import reflection
-from ...sql import coercions
 from ...sql import compiler
 from ...sql import elements
-from ...sql import roles
 from ...sql import util as sql_util
 from ...types import BINARY
 from ...types import BLOB
@@ -1296,15 +1207,6 @@ class MySQLExecutionContext(default.DefaultExecutionContext):
         else:
             raise NotImplementedError()
 
-    def fire_sequence(self, seq, type_):
-        return self._execute_scalar(
-            (
-                "select nextval(%s)"
-                % self.dialect.identifier_preparer.format_sequence(seq)
-            ),
-            type_,
-        )
-
 
 class MySQLCompiler(compiler.SQLCompiler):
 
@@ -1314,23 +1216,8 @@ class MySQLCompiler(compiler.SQLCompiler):
     extract_map = compiler.SQLCompiler.extract_map.copy()
     extract_map.update({"milliseconds": "millisecond"})
 
-    def default_from(self):
-        """Called when a ``SELECT`` statement has no froms,
-        and no ``FROM`` clause is to be appended.
-
-        """
-        if self.stack:
-            stmt = self.stack[-1]["selectable"]
-            if stmt._where_criteria:
-                return " FROM DUAL"
-
-        return ""
-
     def visit_random_func(self, fn, **kw):
         return "rand%s" % self.function_argspec(fn)
-
-    def visit_sequence(self, seq, **kw):
-        return "nextval(%s)" % self.preparer.format_sequence(seq)
 
     def visit_sysdate_func(self, fn, **kw):
         return "SYSDATE()"
@@ -1396,7 +1283,7 @@ class MySQLCompiler(compiler.SQLCompiler):
     def visit_on_duplicate_key_update(self, on_duplicate, **kw):
         if on_duplicate._parameter_ordering:
             parameter_ordering = [
-                coercions.expect(roles.DMLColumnRole, key)
+                elements._column_as_key(key)
                 for key in on_duplicate._parameter_ordering
             ]
             ordered_keys = set(parameter_ordering)
@@ -1416,7 +1303,7 @@ class MySQLCompiler(compiler.SQLCompiler):
 
             val = on_duplicate.update[column.key]
 
-            if coercions._is_literal(val):
+            if elements._is_literal(val):
                 val = elements.BindParameter(None, val, type_=column.type)
                 value_text = self.process(val.self_group(), use_schema=False)
             else:
@@ -1550,27 +1437,21 @@ class MySQLCompiler(compiler.SQLCompiler):
     def get_select_precolumns(self, select, **kw):
         """Add special MySQL keywords in place of DISTINCT.
 
-        .. deprecated 1.4:: this usage is deprecated.
-           :meth:`_expression.Select.prefix_with` should be used for special
-           keywords at the start of a SELECT.
+        .. note::
+
+          this usage is deprecated.  :meth:`_expression.Select.prefix_with`
+          should be used for special keywords at the start
+          of a SELECT.
 
         """
         if isinstance(select._distinct, util.string_types):
-            util.warn_deprecated(
-                "Sending string values for 'distinct' is deprecated in the "
-                "MySQL dialect and will be removed in a future release.  "
-                "Please use :meth:`.Select.prefix_with` for special keywords "
-                "at the start of a SELECT statement",
-                version="1.4",
-            )
             return select._distinct.upper() + " "
+        elif select._distinct:
+            return "DISTINCT "
+        else:
+            return ""
 
-        return super(MySQLCompiler, self).get_select_precolumns(select, **kw)
-
-    def visit_join(self, join, asfrom=False, from_linter=None, **kwargs):
-        if from_linter:
-            from_linter.edges.add((join.left, join.right))
-
+    def visit_join(self, join, asfrom=False, **kwargs):
         if join.full:
             join_type = " FULL OUTER JOIN "
         elif join.isouter:
@@ -1580,15 +1461,11 @@ class MySQLCompiler(compiler.SQLCompiler):
 
         return "".join(
             (
-                self.process(
-                    join.left, asfrom=True, from_linter=from_linter, **kwargs
-                ),
+                self.process(join.left, asfrom=True, **kwargs),
                 join_type,
-                self.process(
-                    join.right, asfrom=True, from_linter=from_linter, **kwargs
-                ),
+                self.process(join.right, asfrom=True, **kwargs),
                 " ON ",
-                self.process(join.onclause, from_linter=from_linter, **kwargs),
+                self.process(join.onclause, **kwargs),
             )
         )
 
@@ -2149,9 +2026,12 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
             return self._extend_numeric(type_, "SMALLINT")
 
     def visit_BIT(self, type_, **kw):
-        if type_.length is not None:
-            return "BIT(%s)" % type_.length
-        else:
+        try:
+            if type_.length is not None:
+                return "BIT(%s)" % type_.length
+            else:
+                return "BIT"
+        except AttributeError:
             return "BIT"
 
     def visit_DATETIME(self, type_, **kw):
@@ -2277,10 +2157,14 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
         )
 
     def visit_ENUM(self, type_, **kw):
-        return self._visit_enumerated_values("ENUM", type_, type_.enums)
+        return self._visit_enumerated_values(
+            "ENUM", type_, type_._enumerated_values
+        )
 
     def visit_SET(self, type_, **kw):
-        return self._visit_enumerated_values("SET", type_, type_.values)
+        return self._visit_enumerated_values(
+            "SET", type_, type_._enumerated_values
+        )
 
     def visit_BOOLEAN(self, type_, **kw):
         return "BOOL"
@@ -2324,11 +2208,6 @@ class MySQLDialect(default.DefaultDialect):
     max_index_name_length = 64
 
     supports_native_enum = True
-
-    supports_sequences = False  # default for MySQL ...
-    # ... may be updated to True for MariaDB 10.3+ in initialize()
-
-    sequences_optional = True
 
     supports_for_update_of = False  # default for MySQL ...
     # ... may be updated to True for MySQL 8+ in initialize()
@@ -2504,28 +2383,28 @@ class MySQLDialect(default.DefaultDialect):
             raise
 
     def do_begin_twophase(self, connection, xid):
-        connection.execute(sql.text("XA BEGIN :xid"), dict(xid=xid))
+        connection.execute(sql.text("XA BEGIN :xid"), xid=xid)
 
     def do_prepare_twophase(self, connection, xid):
-        connection.execute(sql.text("XA END :xid"), dict(xid=xid))
-        connection.execute(sql.text("XA PREPARE :xid"), dict(xid=xid))
+        connection.execute(sql.text("XA END :xid"), xid=xid)
+        connection.execute(sql.text("XA PREPARE :xid"), xid=xid)
 
     def do_rollback_twophase(
         self, connection, xid, is_prepared=True, recover=False
     ):
         if not is_prepared:
-            connection.execute(sql.text("XA END :xid"), dict(xid=xid))
-        connection.execute(sql.text("XA ROLLBACK :xid"), dict(xid=xid))
+            connection.execute(sql.text("XA END :xid"), xid=xid)
+        connection.execute(sql.text("XA ROLLBACK :xid"), xid=xid)
 
     def do_commit_twophase(
         self, connection, xid, is_prepared=True, recover=False
     ):
         if not is_prepared:
             self.do_prepare_twophase(connection, xid)
-        connection.execute(sql.text("XA COMMIT :xid"), dict(xid=xid))
+        connection.execute(sql.text("XA COMMIT :xid"), xid=xid)
 
     def do_recover_twophase(self, connection):
-        resultset = connection.exec_driver_sql("XA RECOVER")
+        resultset = connection.execute("XA RECOVER")
         return [row["data"][0 : row["gtrid_length"]] for row in resultset]
 
     def is_disconnect(self, e, connection, cursor):
@@ -2533,7 +2412,6 @@ class MySQLDialect(default.DefaultDialect):
             e, (self.dbapi.OperationalError, self.dbapi.ProgrammingError)
         ):
             return self._extract_error_code(e) in (
-                1927,
                 2006,
                 2013,
                 2014,
@@ -2553,7 +2431,7 @@ class MySQLDialect(default.DefaultDialect):
         """Proxy result rows to smooth over MySQL-Python driver
         inconsistencies."""
 
-        return [_DecodingRow(row, charset) for row in rp.fetchall()]
+        return [_DecodingRowProxy(row, charset) for row in rp.fetchall()]
 
     def _compat_fetchone(self, rp, charset=None):
         """Proxy a result row to smooth over MySQL-Python driver
@@ -2561,7 +2439,7 @@ class MySQLDialect(default.DefaultDialect):
 
         row = rp.fetchone()
         if row:
-            return _DecodingRow(row, charset)
+            return _DecodingRowProxy(row, charset)
         else:
             return None
 
@@ -2571,7 +2449,7 @@ class MySQLDialect(default.DefaultDialect):
 
         row = rp.first()
         if row:
-            return _DecodingRow(row, charset)
+            return _DecodingRowProxy(row, charset)
         else:
             return None
 
@@ -2579,7 +2457,7 @@ class MySQLDialect(default.DefaultDialect):
         raise NotImplementedError()
 
     def _get_default_schema_name(self, connection):
-        return connection.exec_driver_sql("SELECT DATABASE()").scalar()
+        return connection.execute("SELECT DATABASE()").scalar()
 
     def has_table(self, connection, table_name, schema=None):
         # SHOW TABLE STATUS LIKE and SHOW TABLES LIKE do not function properly
@@ -2604,7 +2482,7 @@ class MySQLDialect(default.DefaultDialect):
             try:
                 rs = connection.execution_options(
                     skip_user_error_events=True
-                ).exec_driver_sql(st)
+                ).execute(st)
                 have = rs.fetchone() is not None
                 rs.close()
                 return have
@@ -2615,50 +2493,6 @@ class MySQLDialect(default.DefaultDialect):
         finally:
             if rs:
                 rs.close()
-
-    def has_sequence(self, connection, sequence_name, schema=None):
-        if not self.supports_sequences:
-            self._sequences_not_supported()
-        if not schema:
-            schema = self.default_schema_name
-        # MariaDB implements sequences as a special type of table
-        #
-        cursor = connection.execute(
-            sql.text(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_TYPE='SEQUENCE' and TABLE_NAME=:name AND "
-                "TABLE_SCHEMA=:schema_name"
-            ),
-            dict(name=sequence_name, schema_name=schema),
-        )
-        return cursor.first() is not None
-
-    def _sequences_not_supported(self):
-        raise NotImplementedError(
-            "Sequences are supported only by the "
-            "MariaDB series 10.3 or greater"
-        )
-
-    @reflection.cache
-    def get_sequence_names(self, connection, schema=None, **kw):
-        if not self.supports_sequences:
-            self._sequences_not_supported()
-        if not schema:
-            schema = self.default_schema_name
-        # MariaDB implements sequences as a special type of table
-        cursor = connection.execute(
-            sql.text(
-                "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES "
-                "WHERE TABLE_TYPE='SEQUENCE' and TABLE_SCHEMA=:schema_name"
-            ),
-            dict(schema_name=schema),
-        )
-        return [
-            row[0]
-            for row in self._compat_fetchall(
-                cursor, charset=self._connection_charset
-            )
-        ]
 
     def initialize(self, connection):
         self._connection_charset = self._detect_charset(connection)
@@ -2673,10 +2507,6 @@ class MySQLDialect(default.DefaultDialect):
             )
 
         default.DefaultDialect.initialize(self, connection)
-
-        self.supports_sequences = (
-            self._is_mariadb and self.server_version_info >= (10, 3)
-        )
 
         self.supports_for_update_of = (
             self._is_mysql and self.server_version_info >= (8,)
@@ -2739,7 +2569,7 @@ class MySQLDialect(default.DefaultDialect):
 
     @reflection.cache
     def get_schema_names(self, connection, **kw):
-        rp = connection.exec_driver_sql("SHOW schemas")
+        rp = connection.execute("SHOW schemas")
         return [r[0] for r in rp]
 
     @reflection.cache
@@ -2752,7 +2582,7 @@ class MySQLDialect(default.DefaultDialect):
 
         charset = self._connection_charset
         if self.server_version_info < (5, 0, 2):
-            rp = connection.exec_driver_sql(
+            rp = connection.execute(
                 "SHOW TABLES FROM %s"
                 % self.identifier_preparer.quote_identifier(current_schema)
             )
@@ -2760,7 +2590,7 @@ class MySQLDialect(default.DefaultDialect):
                 row[0] for row in self._compat_fetchall(rp, charset=charset)
             ]
         else:
-            rp = connection.exec_driver_sql(
+            rp = connection.execute(
                 "SHOW FULL TABLES FROM %s"
                 % self.identifier_preparer.quote_identifier(current_schema)
             )
@@ -2780,7 +2610,7 @@ class MySQLDialect(default.DefaultDialect):
         if self.server_version_info < (5, 0, 2):
             return self.get_table_names(connection, schema)
         charset = self._connection_charset
-        rp = connection.exec_driver_sql(
+        rp = connection.execute(
             "SHOW FULL TABLES FROM %s"
             % self.identifier_preparer.quote_identifier(schema)
         )
@@ -2842,7 +2672,7 @@ class MySQLDialect(default.DefaultDialect):
 
             con_kw = {}
             for opt in ("onupdate", "ondelete"):
-                if spec.get(opt, False) not in ("NO ACTION", None):
+                if spec.get(opt, False):
                     con_kw[opt] = spec[opt]
 
             fkey_d = {
@@ -2908,7 +2738,7 @@ class MySQLDialect(default.DefaultDialect):
                     :table_data;
                 """
                 ).bindparams(sql.bindparam("table_data", expanding=True)),
-                dict(table_data=col_tuples),
+                table_data=col_tuples,
             )
 
             # in casing=0, table name and schema name come back in their
@@ -3092,9 +2922,7 @@ class MySQLDialect(default.DefaultDialect):
 
         charset = self._connection_charset
         row = self._compat_first(
-            connection.execute(
-                sql.text("SHOW VARIABLES LIKE 'lower_case_table_names'")
-            ),
+            connection.execute("SHOW VARIABLES LIKE 'lower_case_table_names'"),
             charset=charset,
         )
         if not row:
@@ -3122,14 +2950,14 @@ class MySQLDialect(default.DefaultDialect):
             pass
         else:
             charset = self._connection_charset
-            rs = connection.exec_driver_sql("SHOW COLLATION")
+            rs = connection.execute("SHOW COLLATION")
             for row in self._compat_fetchall(rs, charset):
                 collations[row[0]] = row[1]
         return collations
 
     def _detect_sql_mode(self, connection):
         row = self._compat_first(
-            connection.exec_driver_sql("SHOW VARIABLES LIKE 'sql_mode'"),
+            connection.execute("SHOW VARIABLES LIKE 'sql_mode'"),
             charset=self._connection_charset,
         )
 
@@ -3170,7 +2998,7 @@ class MySQLDialect(default.DefaultDialect):
         try:
             rp = connection.execution_options(
                 skip_user_error_events=True
-            ).exec_driver_sql(st)
+            ).execute(st)
         except exc.DBAPIError as e:
             if self._extract_error_code(e.orig) == 1146:
                 util.raise_(exc.NoSuchTableError(full_name), replace_context=e)
@@ -3180,6 +3008,8 @@ class MySQLDialect(default.DefaultDialect):
         if not row:
             raise exc.NoSuchTableError(full_name)
         return row[1].strip()
+
+        return sql
 
     def _describe_table(self, connection, table, charset=None, full_name=None):
         """Run DESCRIBE for a ``Table`` and return processed rows."""
@@ -3193,7 +3023,7 @@ class MySQLDialect(default.DefaultDialect):
             try:
                 rp = connection.execution_options(
                     skip_user_error_events=True
-                ).exec_driver_sql(st)
+                ).execute(st)
             except exc.DBAPIError as e:
                 code = self._extract_error_code(e.orig)
                 if code == 1146:
@@ -3217,7 +3047,7 @@ class MySQLDialect(default.DefaultDialect):
         return rows
 
 
-class _DecodingRow(object):
+class _DecodingRowProxy(object):
     """Return unicode-decoded values based on type inspection.
 
     Smooth over data type issues (esp. with alpha driver versions) and
