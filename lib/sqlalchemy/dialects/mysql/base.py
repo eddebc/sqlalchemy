@@ -2125,9 +2125,12 @@ class MySQLTypeCompiler(compiler.GenericTypeCompiler):
             return self._extend_numeric(type_, "SMALLINT")
 
     def visit_BIT(self, type_, **kw):
-        if type_.length is not None:
-            return "BIT(%s)" % type_.length
-        else:
+        try:
+            if type_.length is not None:
+                return "BIT(%s)" % type_.length
+            else:
+                return "BIT"
+        except AttributeError:
             return "BIT"
 
     def visit_DATETIME(self, type_, **kw):
